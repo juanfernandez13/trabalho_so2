@@ -1,29 +1,34 @@
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.function.Consumer;
-import java.util.List; // Importação adicionada
 
 public class Processo extends Thread {
     public enum Status {
-        RODANDO, BLOQUEADO, CONCLUIDO, ENCERRADO // Adicionado ENCERRADO para clareza
+        RODANDO, BLOQUEADO, CONCLUIDO, ENCERRADO
     }
 
     private int id;
-    private long deltaTs; // Intervalo de tempo de solicitação (em segundos)
-    private long deltaTu; // Intervalo de tempo de utilização (em segundos)
-    private Map<Integer, Recurso> recursosDisponiveis; // Referência a todos os recursos do sistema
-    private Map<Integer, Integer> recursosAlocados;    // Recursos que este processo possui (Recurso ID -> Quantidade)
-    private Recurso recursoAguardando;                 // Recurso que o processo está esperando, se estiver bloqueado
+    private long deltaTs;
+    private long deltaTu;
+    private Map<Integer, Recurso> recursosDisponiveis;
+    private Map<Integer, Integer> recursosAlocados; // Recurso ID -> Quantidade (Recursos atualmente detidos)
+    private Recurso recursoAguardando; // Recurso que o processo está esperando AGORA
     private Status status;
     private Random random;
-    private Consumer<String> logConsumer;              // Callback para registrar mensagens na UI
-    private Consumer<Runnable> uiUpdateCallback;       // Callback para atualizar a UI na EDT
-    private volatile boolean running = true;           // Flag para controlar a execução da thread
-    private Semaphore blockSemaphore = new Semaphore(0); // Semáforo para bloquear/desbloquear o processo
+    private Consumer<String> logConsumer;
+    private Consumer<Runnable> uiUpdateCallback;
+    private volatile boolean running = true;
 
-    public Processo(int id, long deltaTs, long deltaTu, Map<Integer, Recurso> recursosDisponiveis, Consumer<String> logConsumer, Consumer<Runnable> uiUpdateCallback) {
+    private Semaphore simulationStartSemaphore; // Semáforo para controlar o início da simulação
+
+    // NOVO: Conjunto de recursos que o processo DESEJA adquirir para completar sua tarefa
+    // (Por exemplo, para simular que precisa de R1 e R2 para uma tarefa)
+    // Para simplificar, vamos fazer ele tentar adquirir 2 recursos aleatórios e depois liberar ambos.
+    private Set<Integer> recursosDesejadosIds = new HashSet<>();
+    private int maxRecursosParaAdquirirPorCiclo = 2; // Tentará adquirir até 2 recursos por vez para sua "tarefa"
+
+    public Processo(int id, long deltaTs, long deltaTu, Map<Integer, Recurso> recursosDisponiveis, Consumer<String> logConsumer, Consumer<Runnable> uiUpdateCallback, Semaphore simulationStartSemaphore) {
         this.id = id;
         this.deltaTs = deltaTs;
         this.deltaTu = deltaTu;
@@ -33,6 +38,30 @@ public class Processo extends Thread {
         this.random = new Random();
         this.logConsumer = logConsumer;
         this.uiUpdateCallback = uiUpdateCallback;
+        this.simulationStartSemaphore = simulationStartSemaphore;
+
+        // Ao criar o processo, ele "define" quais 2 recursos (aleatoriamente) ele vai querer neste ciclo.
+        // Isso é crucial para o teste de deadlock, pois processos com IDs diferentes
+        // podem ter "desejos" conflitantes que levam ao abraço mortal.
+        List<Recurso> allResources = new ArrayList<>(recursosDisponiveis.values());
+        if (allResources.size() >= 2) { // Precisa de pelo menos 2 tipos de recursos
+            int idx1 = random.nextInt(allResources.size());
+            int idx2 = random.nextInt(allResources.size());
+            while(idx1 == idx2 && allResources.size() > 1) { // Garante recursos diferentes
+                idx2 = random.nextInt(allResources.size());
+            }
+            recursosDesejadosIds.add(allResources.get(idx1).getId());
+            recursosDesejadosIds.add(allResources.get(idx2).getId());
+            maxRecursosParaAdquirirPorCiclo = recursosDesejadosIds.size(); // Ajusta para o número real de desejados
+            log("Processo P" + id + " deseja adquirir recursos: " + recursosDesejadosIds);
+        } else if (allResources.size() == 1) {
+            recursosDesejadosIds.add(allResources.get(0).getId());
+            maxRecursosParaAdquirirPorCiclo = 1;
+            log("Processo P" + id + " deseja adquirir recurso: " + recursosDesejadosIds);
+        } else {
+            maxRecursosParaAdquirirPorCiclo = 0; // Não há recursos para desejar
+            log("Processo P" + id + ": Não há recursos suficientes para definir desejos.");
+        }
     }
 
     public int getProcessId() {
@@ -51,141 +80,127 @@ public class Processo extends Thread {
         return recursosAlocados;
     }
 
-    // Método para encerrar o processo de forma controlada
     public void encerrar() {
         this.running = false;
-        // Se o processo estiver bloqueado, libera-o para que possa sair do 'acquire()' e terminar
-        if (status == Status.BLOQUEADO) {
-            blockSemaphore.release();
-        }
+        this.interrupt();
         log("Processo " + id + " está sendo encerrado.");
-        liberarTodosRecursos(); // Libera quaisquer recursos que o processo possa estar segurando
+        liberarTodosRecursos();
         status = Status.ENCERRADO;
         updateUI();
     }
 
-    // Registra uma mensagem no log da interface (executado na EDT via callback)
     private void log(String message) {
         if (logConsumer != null) {
             logConsumer.accept("P" + id + ": " + message);
         }
     }
 
-    // Solicita uma atualização da interface gráfica (executado na EDT via callback)
     private void updateUI() {
         if (uiUpdateCallback != null) {
-            uiUpdateCallback.accept(() -> {}); // Executa um Runnable vazio para forçar a atualização da UI
+            uiUpdateCallback.accept(() -> {});
         }
     }
 
     @Override
     public void run() {
-        log("Iniciado.");
-        while (running) { // Loop principal do processo
+        log("Aguardando início da simulação...");
+        status = Status.BLOQUEADO;
+        updateUI();
+
+        try {
+            simulationStartSemaphore.acquire();
+            log("Iniciado.");
+            status = Status.RODANDO;
+            updateUI();
+        } catch (InterruptedException e) {
+            log("Processo " + id + " interrompido antes do início da simulação. Encerrando.");
+            running = false;
+            Thread.currentThread().interrupt();
+            liberarTodosRecursos();
+            status = Status.ENCERRADO;
+            updateUI();
+            return;
+        }
+
+        while (running) {
             try {
-                // Intervalo de tempo entre as solicitações de recurso
-                Thread.sleep(deltaTs * 1000);
+                // Ciclo principal do processo: tentar adquirir seus recursos desejados
+                // até que tenha todos eles ou seja bloqueado
 
-                if (!running) break; // Verifica a flag de execução após o sleep
-
-                // Escolhe um recurso aleatoriamente para solicitar
-                if (recursosDisponiveis.isEmpty()) {
-                    log("Não há recursos configurados para solicitar. Encerrando.");
-                    break; // Sai do loop se não houver recursos no sistema
-                }
-                List<Recurso> recursosList = new java.util.ArrayList<>(recursosDisponiveis.values());
-                if (recursosList.isEmpty()) { // Garante que a lista não esteja vazia após a cópia
-                    log("Lista de recursos disponível vazia. Encerrando.");
-                    break;
-                }
-                Recurso recursoSolicitado = recursosList.get(random.nextInt(recursosList.size()));
-
-                log("Solicitando recurso " + recursoSolicitado.getNome() + ".");
-                status = Status.RODANDO; // Presume rodando antes de tentar alocar
-                updateUI();
-
-                // Sincroniza no objeto Recurso para garantir que a alocação/liberação
-                // de instâncias (através do Semaphore) seja feita de forma consistente
-                // e para que outros processos que estejam no 'synchronized' por este recurso esperem.
-                // Embora Semaphore já seja thread-safe, este 'synchronized' aqui serve para
-                // garantir que o bloco de código completo (tentar alocar, mudar status, etc.)
-                // para um dado recurso seja executado atomicamente por um processo.
-                synchronized (recursoSolicitado) {
-                    if (recursoSolicitado.alocarInstancia()) { // Tenta adquirir 1 permissão do Semaphore
-                        recursosAlocados.merge(recursoSolicitado.getId(), 1, Integer::sum);
-                        log("Recebeu recurso " + recursoSolicitado.getNome() + ". Utilizando...");
-                        updateUI();
-                        // Intervalo de tempo de utilização do recurso
-                        Thread.sleep(deltaTu * 1000);
-                        liberarRecurso(recursoSolicitado);
-                        log("Liberou recurso " + recursoSolicitado.getNome() + ".");
-                    } else {
-                        // Recurso não disponível, processo se bloqueia
-                        log("Recurso " + recursoSolicitado.getNome() + " não disponível. Bloqueado.");
-                        recursoAguardando = recursoSolicitado;
-                        status = Status.BLOQUEADO;
-                        updateUI();
-                        try {
-                            // Processo espera aqui até que o Sistema Operacional o acorde
-                            blockSemaphore.acquire();
-                            log("Desbloqueado e tentando alocar novamente o recurso " + recursoSolicitado.getNome());
-
-                            // Após ser acordado, tenta alocar novamente o recurso.
-                            // É importante re-sincronizar no recurso para garantir que
-                            // a nova tentativa de alocação seja consistente.
-                            synchronized (recursoSolicitado) {
-                                if (recursoSolicitado.alocarInstancia()) {
-                                    recursosAlocados.merge(recursoSolicitado.getId(), 1, Integer::sum);
-                                    log("Recebeu recurso " + recursoSolicitado.getNome() + " após desbloqueio. Utilizando...");
-                                    updateUI();
-                                    Thread.sleep(deltaTu * 1000);
-                                    liberarRecurso(recursoSolicitado);
-                                    log("Liberou recurso " + recursoSolicitado.getNome() + ".");
-                                } else {
-                                    // Pode acontecer se outro processo pegou o recurso logo após o 'release'
-                                    log("Recurso " + recursoSolicitado.getNome() + " ainda não disponível após desbloqueio. Tentará novamente no próximo ciclo.");
-                                }
-                            }
-                        } catch (InterruptedException e) {
-                            // Se a thread for interrompida enquanto bloqueada (ex: por um processo sendo removido)
-                            log("Processo " + id + " foi interrompido enquanto bloqueado. Encerrando.");
-                            running = false; // Define a flag para sair do loop
-                        } finally {
-                            recursoAguardando = null; // Limpa o recurso aguardado
-                            status = Status.RODANDO; // Retorna ao status de rodando (se não foi encerrado)
-                            updateUI();
-                        }
+                // Filtra os recursos desejados que ainda não foram alocados
+                List<Integer> recursosPendentesIds = new ArrayList<>();
+                for(Integer desiredId : recursosDesejadosIds) {
+                    if (!recursosAlocados.containsKey(desiredId) || recursosAlocados.get(desiredId) == 0) {
+                        recursosPendentesIds.add(desiredId);
                     }
                 }
+
+                if (recursosPendentesIds.isEmpty()) {
+                    // Se o processo já tem todos os recursos desejados, ele os utiliza e depois libera.
+                    log("Possui todos os recursos desejados: " + recursosAlocados.keySet() + ". Utilizando...");
+                    updateUI();
+                    Thread.sleep(deltaTu * 1000); // Utiliza todos os recursos juntos
+                    liberarTodosRecursos(); // Libera TUDO
+                    log("Liberou todos os recursos. Iniciando novo ciclo de solicitação.");
+                    // Define novos recursos desejados para o próximo ciclo
+                    definirNovosRecursosDesejados();
+                    Thread.sleep(deltaTs * 1000); // Pausa antes de começar a solicitar novamente
+                } else {
+                    // Ainda precisa de recursos. Tenta adquirir um dos recursos pendentes.
+                    // Escolhe um recurso pendente aleatoriamente para tentar adquirir.
+                    Recurso recursoSolicitado = recursosDisponiveis.get(recursosPendentesIds.get(random.nextInt(recursosPendentesIds.size())));
+
+                    if (recursoSolicitado == null) {
+                        log("Recurso desejado (ID " + recursoSolicitado.getId() + ") não encontrado. Encerrando.");
+                        running = false;
+                        break;
+                    }
+
+                    log("Tentando adquirir recurso: " + recursoSolicitado.getNome() + " (pendentes: " + recursosPendentesIds + "). Possuídos: " + recursosAlocados.keySet());
+                    recursoAguardando = recursoSolicitado;
+                    status = Status.BLOQUEADO; // Marca como BLOQUEADO antes de tentar adquirir
+                    updateUI();
+
+                    recursoSolicitado.alocarInstancia(); // Bloqueia aqui se não disponível!
+
+                    // Se chegou aqui, conseguiu alocar!
+                    recursosAlocados.merge(recursoSolicitado.getId(), 1, Integer::sum);
+                    log("Adquiriu recurso " + recursoSolicitado.getNome() + ". Possuídos: " + recursosAlocados.keySet());
+                    recursoAguardando = null; // Não está mais aguardando
+                    status = Status.RODANDO; // Voltou a rodar
+                    updateUI();
+
+                    // Se não adquiriu todos, espera um pouco e tenta o próximo.
+                    if (recursosAlocados.size() < maxRecursosParaAdquirirPorCiclo) {
+                        Thread.sleep(deltaTs * 500); // Uma pausa menor entre tentativas de aquisição interna
+                    }
+                    // O loop continuará para tentar adquirir os recursos restantes.
+                }
+
             } catch (InterruptedException e) {
-                // Se a thread for interrompida durante o sleep principal
                 log("Processo " + id + " foi interrompido. Encerrando.");
                 running = false;
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
-                // Captura outras exceções inesperadas
                 log("Erro inesperado no Processo " + id + ": " + e.getMessage());
-                e.printStackTrace(); // Imprime o stack trace para depuração
+                e.printStackTrace();
                 running = false;
             }
         }
-        status = Status.CONCLUIDO; // Processo concluiu sua execução normal
+        status = Status.CONCLUIDO;
         liberarTodosRecursos();
         log("Concluído.");
         updateUI();
     }
 
-    // Libera uma única instância de um recurso que o processo alocou
     private void liberarRecurso(Recurso recurso) {
-        synchronized (recurso) { // Sincroniza para consistência com o Semaphore
-            recurso.liberarInstancia(); // Chama o método do Recurso para liberar a permissão
-            // Decrementa a contagem de recursos alocados para este processo
+        if (recurso != null) {
+            recurso.liberarInstancia();
             recursosAlocados.computeIfPresent(recurso.getId(), (key, val) -> val - 1);
-            // Remove a entrada se a contagem chegar a zero ou menos
             recursosAlocados.entrySet().removeIf(entry -> entry.getValue() <= 0);
         }
     }
 
-    // Libera todas as instâncias de todos os recursos que o processo possui
     private void liberarTodosRecursos() {
         // Cria uma cópia das chaves para evitar ConcurrentModificationException
         for (Integer recursoId : new java.util.ArrayList<>(recursosAlocados.keySet())) {
@@ -193,20 +208,34 @@ public class Processo extends Thread {
             if (recurso != null) {
                 int instancias = recursosAlocados.getOrDefault(recursoId, 0);
                 for (int i = 0; i < instancias; i++) {
-                    recurso.liberarInstancia(); // Libera cada instância alocada
+                    recurso.liberarInstancia();
                 }
                 log("Liberou todas as " + instancias + " instâncias do recurso " + recurso.getNome() + ".");
             }
         }
-        recursosAlocados.clear(); // Limpa o mapa de recursos alocados pelo processo
+        recursosAlocados.clear();
         updateUI();
     }
 
-    // Método chamado pelo Sistema Operacional para acordar um processo bloqueado
-    public void awakenIfWaitingFor(Recurso liberatedResource) {
-        // Verifica se o processo está bloqueado E aguardando por este recurso específico
-        if (status == Status.BLOQUEADO && recursoAguardando != null && recursoAguardando.equals(liberatedResource)) {
-            blockSemaphore.release(); // Libera uma permissão no semáforo de bloqueio, acordando o processo
+    // Define um novo conjunto de recursos aleatórios que o processo desejará para o próximo ciclo
+    private void definirNovosRecursosDesejados() {
+        recursosDesejadosIds.clear();
+        List<Recurso> allResources = new ArrayList<>(recursosDisponiveis.values());
+        if (allResources.size() >= 2) {
+            int idx1 = random.nextInt(allResources.size());
+            int idx2 = random.nextInt(allResources.size());
+            while(idx1 == idx2 && allResources.size() > 1) {
+                idx2 = random.nextInt(allResources.size());
+            }
+            recursosDesejadosIds.add(allResources.get(idx1).getId());
+            recursosDesejadosIds.add(allResources.get(idx2).getId());
+            maxRecursosParaAdquirirPorCiclo = recursosDesejadosIds.size();
+        } else if (allResources.size() == 1) {
+            recursosDesejadosIds.add(allResources.get(0).getId());
+            maxRecursosParaAdquirirPorCiclo = 1;
+        } else {
+            maxRecursosParaAdquirirPorCiclo = 0;
         }
+        log("Processo P" + id + " definiu novos desejos: " + recursosDesejadosIds);
     }
 }

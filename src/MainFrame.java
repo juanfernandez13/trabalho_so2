@@ -13,37 +13,21 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.Random; // Importa Processo e Recurso (apenas para MainFrame, se forem classes internas completas)
-import java.util.concurrent.Semaphore;
-import java.util.Arrays;
-import java.util.function.Consumer;
-
-// ----------------------------------------------------------------------
-// IMPORTANTE: Todas as classes a seguir (Recurso, Processo, SistemaOperacional)
-// e as classes de UI auxiliares (PainelRecursos, PainelProcessos, PainelLog,
-// ConfiguracaoRecursosDialog, AdicionarProcessoDialog) DEVEM SER COLOCADAS
-// EM ARQUIVOS SEPARADOS NO MESMO DIRETÓRIO (src) ou COMO CLASSES INTERNAS
-// DENTRO DE MainFrame, conforme esta versão.
-// ----------------------------------------------------------------------
-
-// Se você manter Recurso, Processo, SistemaOperacional em arquivos separados
-// (que é o ideal, mesmo que estejam no mesmo diretório src),
-// VOCÊ PRECISA COPIAR O CONTEÚDO DESSES ARQUIVOS ABAIXO E COLÁ-LOS EM
-// SEUS RESPECTIVOS ARQUIVOS "Recurso.java", "Processo.java" e "SistemaOperacional.java".
-
-// Caso contrário, se você quiser TUDO em um único MainFrame.java
-// (não recomendado para organização, mas possível), então essas classes
-// também deveriam ser aninhadas aqui, o que tornaria o arquivo GIGANTE.
-// Para simplicidade e seguir a intenção da questão anterior, vamos manter
-// elas como arquivos separados sem declaração de pacote.
-
-// As classes auxiliares de UI (PainelRecursos, etc.) ESTÃO ANINHADAS aqui.
+import java.util.concurrent.Semaphore; // Usado para controle de início de simulação
+import java.util.Arrays; // Necessário para Arrays.deepToString e Arrays.copyOf
+import java.util.Random; // Necessário para a lógica do Processo (escolha aleatória)
+import java.util.concurrent.TimeUnit; // Necessário para Semaphore.tryAcquire com timeout
+import java.util.function.Consumer; // Usado para callbacks de log e UI
 
 public class MainFrame extends JFrame {
 
     private Map<Integer, Recurso> recursos = new ConcurrentHashMap<>();
     private Map<Integer, Processo> processos = new ConcurrentHashMap<>();
     private SistemaOperacional sistemaOperacional;
+
+    // Semáforo para controlar o início dos processos
+    private Semaphore simulationStartSemaphore;
+    private boolean simulationStarted = false;
 
     private PainelRecursos painelRecursos;
     private PainelProcessos painelProcessos;
@@ -65,9 +49,11 @@ public class MainFrame extends JFrame {
         createLayout();
         addWindowCloseListener();
 
-        // Desabilita botões que dependem da configuração de recursos inicialmente
         btnIniciarSimulacao.setEnabled(false);
         btnAdicionarProcesso.setEnabled(false);
+
+        // Inicializa o semáforo com 0 permissões. Processos ficarão bloqueados.
+        simulationStartSemaphore = new Semaphore(0);
     }
 
     private void initComponents() {
@@ -129,11 +115,17 @@ public class MainFrame extends JFrame {
                 if (sistemaOperacional != null) {
                     sistemaOperacional.encerrar();
                 }
+                // Garante que todos os processos sejam acordados para poderem encerrar
+                if (!simulationStarted) {
+                    // Libera um número grande de permissões para acordar todos os processos
+                    // que podem estar esperando para iniciar (evita que fiquem presos ao fechar).
+                    simulationStartSemaphore.release(1000);
+                }
                 for (Processo p : processos.values()) {
                     p.encerrar();
                 }
                 try {
-                    Thread.sleep(100); // Pequeno delay para threads encerrarem
+                    Thread.sleep(100);
                 } catch (InterruptedException ex) {
                     Thread.currentThread().interrupt();
                 }
@@ -145,8 +137,8 @@ public class MainFrame extends JFrame {
         ConfiguracaoRecursosDialog dialog = new ConfiguracaoRecursosDialog(this, recursos);
         dialog.setVisible(true);
         if (dialog.isConfigured()) {
-            recursos.clear(); // Limpa os recursos anteriores
-            recursos.putAll(dialog.getRecursosConfigurados()); // Adiciona os novos
+            recursos.clear();
+            recursos.putAll(dialog.getRecursosConfigurados());
             painelRecursos.atualizarRecursos(recursos.values());
             btnIniciarSimulacao.setEnabled(true);
             btnAdicionarProcesso.setEnabled(true);
@@ -155,7 +147,7 @@ public class MainFrame extends JFrame {
     }
 
     private void iniciarSimulacao() {
-        if (sistemaOperacional != null && sistemaOperacional.isAlive()) {
+        if (simulationStarted) {
             JOptionPane.showMessageDialog(this, "A simulação já está em execução.", "Aviso", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
@@ -171,6 +163,11 @@ public class MainFrame extends JFrame {
                 sistemaOperacional = new SistemaOperacional(deltaT, recursos, processos, this::log, this::updateDeadlockStatus);
                 sistemaOperacional.start();
                 log("Simulação iniciada. SO verificando a cada " + deltaT + " segundos.");
+
+                // Sinaliza para todos os processos que eles podem começar
+                simulationStartSemaphore.release(1000); // Libera 1000 permissões
+                simulationStarted = true;
+
                 btnIniciarSimulacao.setEnabled(false);
                 btnConfigurarRecursos.setEnabled(false);
             } catch (NumberFormatException ex) {
@@ -203,11 +200,12 @@ public class MainFrame extends JFrame {
                 return;
             }
 
-            Processo novoProcesso = new Processo(id, deltaTs, deltaTu, recursos, this::log, this::updateUI);
+            // Passa o semáforo para o construtor do Processo
+            Processo novoProcesso = new Processo(id, deltaTs, deltaTu, recursos, this::log, this::updateUI, simulationStartSemaphore);
             processos.put(id, novoProcesso);
-            novoProcesso.start();
-            log("Processo P" + id + " criado e iniciado (Ts: " + deltaTs + "s, Tu: " + deltaTu + "s).");
-            updateUI(null); // Força atualização da UI para mostrar o novo processo
+            novoProcesso.start(); // A thread é iniciada, mas o processo espera internamente
+            log("Processo P" + id + " criado e iniciado (Ts: " + deltaTs + "s, Tu: " + deltaTu + "s). Esperando sinal de início da simulação.");
+            updateUI(null);
             btnRemoverProcesso.setEnabled(true);
         }
     }
@@ -225,15 +223,14 @@ public class MainFrame extends JFrame {
                 Processo processoARemover = processos.get(id);
                 if (processoARemover != null) {
                     processoARemover.encerrar();
-                    // Pequeno delay para a thread do processo terminar
                     new Thread(() -> {
                         try {
-                            processoARemover.join(1000); // Espera até 1 segundo
+                            processoARemover.join(1000);
                         } catch (InterruptedException ex) {
                             Thread.currentThread().interrupt();
                         } finally {
                             SwingUtilities.invokeLater(() -> {
-                                processos.remove(id); // Remove o processo do mapa
+                                processos.remove(id);
                                 log("Processo P" + id + " removido.");
                                 updateUI(null);
                                 if (processos.isEmpty()) {
@@ -252,12 +249,10 @@ public class MainFrame extends JFrame {
         }
     }
 
-    // Método para adicionar mensagens ao Painel de Log
     private void log(String message) {
         SwingUtilities.invokeLater(() -> painelLog.addLog(message));
     }
 
-    // Método para atualizar a UI dos painéis de recursos e processos
     private void updateUI(Runnable callback) {
         SwingUtilities.invokeLater(() -> {
             painelRecursos.atualizarRecursos(recursos.values());
@@ -268,7 +263,6 @@ public class MainFrame extends JFrame {
         });
     }
 
-    // Método para atualizar o status do deadlock na label principal
     private void updateDeadlockStatus(List<Integer> deadlockedProcessIds) {
         SwingUtilities.invokeLater(() -> {
             if (deadlockedProcessIds != null && !deadlockedProcessIds.isEmpty()) {
@@ -278,14 +272,13 @@ public class MainFrame extends JFrame {
                 statusDeadlockLabel.setText("Status Deadlock: Nenhum deadlock detectado.");
                 statusDeadlockLabel.setForeground(Color.BLUE);
             }
-            // Força a atualização dos painéis para refletir o status de deadlock nos processos
             painelProcessos.setDeadlockedProcesses(deadlockedProcessIds);
             painelProcessos.atualizarProcessos(processos.values());
         });
     }
 
+    // --- CLASSES INTERNAS DE UI ---
 
-    // Classe Interna: Diálogo para Configuração de Recursos
     private class ConfiguracaoRecursosDialog extends JDialog {
 
         private DefaultTableModel tableModel;
@@ -295,32 +288,30 @@ public class MainFrame extends JFrame {
 
         public ConfiguracaoRecursosDialog(JFrame parent, Map<Integer, Recurso> currentResources) {
             super(parent, "Configurar Recursos do Sistema", true);
-            setSize(700, 400);
+            setSize(700, 400); // Ajustado para ter espaço para os botões
             setLocationRelativeTo(parent);
             setLayout(new BorderLayout(10, 10));
             ((JPanel)getContentPane()).setBorder(new EmptyBorder(10, 10, 10, 10));
 
-            recursosConfigurados = new HashMap<>(currentResources); // Copia os recursos existentes
+            recursosConfigurados = new HashMap<>(currentResources);
 
             initComponents();
             populateTable();
         }
 
         private void initComponents() {
-            // Configuração da tabela
             String[] columnNames = {"Nome do Recurso", "ID", "Quantidade Instâncias"};
             tableModel = new DefaultTableModel(columnNames, 0) {
                 @Override
                 public boolean isCellEditable(int row, int column) {
-                    return true; // Todas as células são editáveis
+                    return true;
                 }
             };
             recursoTable = new JTable(tableModel);
             JScrollPane scrollPane = new JScrollPane(recursoTable);
             add(scrollPane, BorderLayout.CENTER);
 
-            // Painel de botões
-            JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT)); // <-- Este painel
+            JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 15, 5)); // Ajustado espaçamento
             JButton addRowButton = new JButton("Adicionar Recurso");
             addRowButton.addActionListener(e -> addEmptyRow());
             buttonPanel.add(addRowButton);
@@ -329,22 +320,19 @@ public class MainFrame extends JFrame {
             deleteRowButton.addActionListener(e -> removeSelectedRow());
             buttonPanel.add(deleteRowButton);
 
-            // GARANTA QUE ESTE BOTÃO ESTEJA AQUI:
             JButton saveButton = new JButton("Salvar Configuração");
             saveButton.addActionListener(e -> saveConfiguration());
-            buttonPanel.add(saveButton); // <-- Adicionar o botão ao painel
+            buttonPanel.add(saveButton);
 
             add(buttonPanel, BorderLayout.SOUTH);
         }
 
-        // Preenche a tabela com os recursos atuais
         private void populateTable() {
             for (Recurso recurso : recursosConfigurados.values()) {
                 tableModel.addRow(new Object[]{recurso.getNome(), recurso.getId(), recurso.getTotalInstancias()});
             }
         }
 
-        // Adiciona uma nova linha vazia na tabela
         private void addEmptyRow() {
             if (tableModel.getRowCount() >= 10) {
                 JOptionPane.showMessageDialog(this, "Número máximo de 10 tipos de recursos atingido.", "Limite de Recursos", JOptionPane.WARNING_MESSAGE);
@@ -353,7 +341,6 @@ public class MainFrame extends JFrame {
             tableModel.addRow(new Object[]{"", "", ""});
         }
 
-        // Remove a linha selecionada da tabela
         private void removeSelectedRow() {
             int selectedRow = recursoTable.getSelectedRow();
             if (selectedRow != -1) {
@@ -363,7 +350,6 @@ public class MainFrame extends JFrame {
             }
         }
 
-        // Salva a configuração dos recursos da tabela
         private void saveConfiguration() {
             Map<Integer, Recurso> tempRecursos = new HashMap<>();
             try {
@@ -387,9 +373,9 @@ public class MainFrame extends JFrame {
 
                     tempRecursos.put(id, new Recurso(nome, id, quantidade));
                 }
-                recursosConfigurados = tempRecursos; // Atualiza o mapa de recursos configurados
-                configured = true; // Marca como configurado com sucesso
-                dispose(); // Fecha o diálogo
+                recursosConfigurados = tempRecursos;
+                configured = true;
+                dispose();
             } catch (NumberFormatException e) {
                 JOptionPane.showMessageDialog(this, "Erro de formato numérico. Verifique os campos ID e Quantidade.", "Erro de Entrada", JOptionPane.ERROR_MESSAGE);
             } catch (IllegalArgumentException e) {
@@ -406,7 +392,6 @@ public class MainFrame extends JFrame {
         }
     }
 
-    // Classe Interna: Painel para exibir o Status dos Processos
     private class PainelProcessos extends JPanel {
 
         private JPanel processosContainer;
@@ -427,7 +412,7 @@ public class MainFrame extends JFrame {
         }
 
         public void atualizarProcessos(Collection<Processo> processos) {
-            processosContainer.removeAll(); // Limpa os componentes existentes
+            processosContainer.removeAll();
             if (processos.isEmpty()) {
                 processosContainer.add(new JLabel("Nenhum processo em execução."));
             } else {
@@ -439,13 +424,15 @@ public class MainFrame extends JFrame {
                             BorderFactory.createEmptyBorder(5, 5, 5, 5)
                     ));
 
-                    // Destaca processos em deadlock
                     boolean isDeadlocked = deadlockedProcesses.contains(processo.getProcessId());
                     processoPanel.setBackground(isDeadlocked ? new Color(255, 200, 200) : UIManager.getColor("Panel.background"));
 
-                    JLabel idLabel = new JLabel("Processo ID: " + processo.getProcessId() + " - Status: " + processo.getStatus());
-                    idLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
+                    JLabel idLabel = new JLabel("PROCESSO ID: " + processo.getProcessId() + " - Status: " + processo.getStatus());
+                    idLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
+                    idLabel.setForeground(Color.DARK_GRAY);
                     processoPanel.add(idLabel);
+
+                    processoPanel.add(Box.createRigidArea(new Dimension(0, 3)));
 
                     if (processo.getStatus() == Processo.Status.BLOQUEADO && processo.getRecursoAguardando() != null) {
                         processoPanel.add(new JLabel("Aguardando: " + processo.getRecursoAguardando().getNome()));
@@ -454,7 +441,6 @@ public class MainFrame extends JFrame {
                     if (!processo.getRecursosAlocados().isEmpty()) {
                         StringBuilder alocados = new StringBuilder("Alocados: ");
                         for (Map.Entry<Integer, Integer> entry : processo.getRecursosAlocados().entrySet()) {
-                            // Poderia buscar o nome do recurso do mapa "recursos" da MainFrame se necessário
                             alocados.append("R").append(entry.getKey()).append(" (x").append(entry.getValue()).append(") ");
                         }
                         processoPanel.add(new JLabel(alocados.toString().trim()));
@@ -463,7 +449,7 @@ public class MainFrame extends JFrame {
                     }
 
                     processosContainer.add(processoPanel);
-                    processosContainer.add(Box.createRigidArea(new Dimension(0, 5))); // Espaçador
+                    processosContainer.add(Box.createRigidArea(new Dimension(0, 8)));
                 }
             }
             revalidate();
@@ -471,7 +457,6 @@ public class MainFrame extends JFrame {
         }
     }
 
-    // Classe Interna: Painel para exibir os Recursos do Sistema
     private class PainelRecursos extends JPanel {
 
         private JPanel recursosContainer;
@@ -487,7 +472,7 @@ public class MainFrame extends JFrame {
         }
 
         public void atualizarRecursos(Collection<Recurso> recursos) {
-            recursosContainer.removeAll(); // Limpa os componentes existentes
+            recursosContainer.removeAll();
             if (recursos.isEmpty()) {
                 recursosContainer.add(new JLabel("Nenhum recurso configurado."));
             } else {
@@ -502,7 +487,6 @@ public class MainFrame extends JFrame {
         }
     }
 
-    // Classe Interna: Painel para exibir o Log de Operações
     private class PainelLog extends JPanel {
 
         private JTextArea logArea;
@@ -522,11 +506,10 @@ public class MainFrame extends JFrame {
         public void addLog(String message) {
             String timestamp = sdf.format(new Date());
             logArea.append("[" + timestamp + "] " + message + "\n");
-            logArea.setCaretPosition(logArea.getDocument().getLength()); // Rola automaticamente para o final
+            logArea.setCaretPosition(logArea.getDocument().getLength());
         }
     }
 
-    // Classe Interna: Diálogo para Adicionar Novo Processo
     private class AdicionarProcessoDialog extends JDialog {
         private JTextField idField;
         private JTextField deltaTsField;
@@ -564,7 +547,6 @@ public class MainFrame extends JFrame {
                         return;
                     }
 
-                    // A validação de ID duplicado e limite de processos é feita no MainFrame.adicionarProcesso()
                     processAdded = true;
                     dispose();
                 } catch (NumberFormatException ex) {
