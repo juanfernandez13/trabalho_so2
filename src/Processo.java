@@ -64,6 +64,24 @@ public class Processo extends Thread {
         }
     }
 
+    public int sleepWork(long durationMs) {
+        if (durationMs <= 0) {
+            return 0;
+        }
+
+        long startTime = System.currentTimeMillis();
+        long endTime = startTime + durationMs;
+
+        Random random = new Random();
+        int lastGeneratedNumber = 0;
+
+        while (System.currentTimeMillis() < endTime) {
+            lastGeneratedNumber = random.nextInt(1000);
+        }
+
+        return lastGeneratedNumber;
+    }
+
     public int getProcessId() {
         return id;
     }
@@ -139,12 +157,12 @@ public class Processo extends Thread {
                     // Se o processo já tem todos os recursos desejados, ele os utiliza e depois libera.
                     log("Possui todos os recursos desejados: " + recursosAlocados.keySet() + ". Utilizando...");
                     updateUI();
-                    Thread.sleep(deltaTu * 1000); // Utiliza todos os recursos juntos
+                    sleepWork(deltaTu * 1000); // Utiliza todos os recursos juntos
                     liberarTodosRecursos(); // Libera TUDO
                     log("Liberou todos os recursos. Iniciando novo ciclo de solicitação.");
                     // Define novos recursos desejados para o próximo ciclo
                     definirNovosRecursosDesejados();
-                    Thread.sleep(deltaTs * 1000); // Pausa antes de começar a solicitar novamente
+                    sleepWork(deltaTs * 1000); // Pausa antes de começar a solicitar novamente
                 } else {
                     // Ainda precisa de recursos. Tenta adquirir um dos recursos pendentes.
                     // Escolhe um recurso pendente aleatoriamente para tentar adquirir.
@@ -172,7 +190,7 @@ public class Processo extends Thread {
 
                     // Se não adquiriu todos, espera um pouco e tenta o próximo.
                     if (recursosAlocados.size() < maxRecursosParaAdquirirPorCiclo) {
-                        Thread.sleep(deltaTs * 500); // Uma pausa menor entre tentativas de aquisição interna
+                        Thread.sleep(deltaTs * 1000); // Uma pausa menor entre tentativas de aquisição interna
                     }
                     // O loop continuará para tentar adquirir os recursos restantes.
                 }
@@ -208,7 +226,7 @@ public class Processo extends Thread {
             if (recurso != null) {
                 int instancias = recursosAlocados.getOrDefault(recursoId, 0);
                 for (int i = 0; i < instancias; i++) {
-                    recurso.liberarInstancia();
+                    liberarRecurso(recurso);
                 }
                 log("Liberou todas as " + instancias + " instâncias do recurso " + recurso.getNome() + ".");
             }

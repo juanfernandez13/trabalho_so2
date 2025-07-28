@@ -1,8 +1,4 @@
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.function.Consumer;
 
 public class SistemaOperacional extends Thread {
@@ -32,22 +28,37 @@ public class SistemaOperacional extends Thread {
         }
     }
 
+    public int sleepWork(long durationMs) {
+        if (durationMs <= 0) {
+            return 0;
+        }
+
+        long startTime = System.currentTimeMillis();
+        long endTime = startTime + durationMs;
+
+        Random random = new Random();
+        int lastGeneratedNumber = 0;
+
+        while (System.currentTimeMillis() < endTime) {
+            lastGeneratedNumber = random.nextInt(1000);
+        }
+
+        return lastGeneratedNumber;
+    }
+
     @Override
     public void run() {
         log("Iniciado monitoramento de deadlocks a cada " + deltaT + " segundos.");
         while (running) {
             try {
-                Thread.sleep(deltaT * 1000);
+                sleepWork(deltaT * 1000);
                 if (!running) break;
 
                 // Apenas detecta deadlock. A notificação de processos bloqueados
                 // é agora responsabilidade do Semaphore do Recurso.
                 detectarDeadlock();
 
-            } catch (InterruptedException e) {
-                log("Sistema Operacional: Monitoramento interrompido.");
-                running = false;
-            } catch (Exception e) {
+            }  catch (Exception e) {
                 log("Erro inesperado no Sistema Operacional: " + e.getMessage());
                 e.printStackTrace();
                 running = false;
